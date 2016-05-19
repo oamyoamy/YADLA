@@ -1,43 +1,59 @@
 package com.kludgenics.alrightypump.android
 
+import android.content.Context
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbManager
 import com.felhr.usbserial.UsbSerialDevice
 import com.felhr.usbserial.UsbSerialInterface
 import okio.Buffer
 import okio.Source
 import okio.Sink
 import okio.Timeout
-import java.io.InterruptedIOException
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 
-class AndroidSerialConnection(val device: UsbDevice, val deviceConnection: UsbDeviceConnection): Source, Sink,
-        UsbSerialInterface.UsbReadCallback {
+class AndroidSerialConnection(context: Context, device: UsbDevice): Source, Sink {
 
-    val serial: UsbSerialDevice = {
-        val device = UsbSerialDevice.createUsbSerialDevice(device, deviceConnection)
-        device.read(this)
-        device
-    }()
+    private var closed: Boolean = false
+    private val serial: UsbSerialDevice
+    private val deviceConnection: UsbDeviceConnection
+    private val blockingQueue = ArrayBlockingQueue<ByteArray>(128)
 
-    val readBuffer = Buffer()
-    public var timeout: Timeout = Timeout.NONE
-    val queue = ArrayBlockingQueue<ByteArray>(4)
+    private val readCallback: UsbSerialInterface.UsbReadCallback = object: UsbSerialInterface.UsbReadCallback {
+        override fun onReceivedData(bytes: ByteArray) {
+            blockingQueue.add(bytes)
+        }
+    }
+
+    init {
+        val manager = context.getSystemService(Context.USB_SERVICE) as UsbManager;
+        deviceConnection = manager.openDevice(device)
+        serial = UsbSerialDevice.createUsbSerialDevice(device, deviceConnection)
+        serial.open()
+        serial.read(readCallback)
+    }
+
+    var timeout: Timeout = Timeout.NONE
 
     override fun read(sink: Buffer, byteCount: Long): Long {
         if (byteCount < 0) throw IllegalArgumentException("byteCount < 0: " + byteCount)
-        return if (readBuffer.size() != 0L) {
-            val toRead = if (byteCount > readBuffer.size()) readBuffer.size() else byteCount
-            sink.write(readBuffer, toRead)
-            toRead
+        return if (closed) {
+            -1L
         } else {
-            val result = queue.poll(timeout.timeoutNanos(), TimeUnit.NANOSECONDS) ?:
-                    throw InterruptedIOException("timeout reading $byteCount bytes")
-            readBuffer.write(result)
-            val toRead = if (byteCount > readBuffer.size()) readBuffer.size() else byteCount
-            sink.write(readBuffer, toRead)
-            toRead
+            val buffer: ByteArray? = try {
+                blockingQueue.poll(5, TimeUnit.SECONDS)
+            } catch (e: InterruptedException) {
+                null
+            }
+            if (buffer == null)
+                if (closed) -1 else 0L
+            else {
+                val bytes = buffer.size
+                if (bytes >= 0)
+                    sink.write(buffer, 0, bytes)
+                bytes.toLong()
+            }
         }
     }
 
@@ -45,25 +61,22 @@ class AndroidSerialConnection(val device: UsbDevice, val deviceConnection: UsbDe
         return timeout
     }
 
-    public fun open() {
-        serial.open()
-    }
-
+    @Synchronized
     override fun close() {
+        closed = true
         serial.close()
-    }
+     }
 
     override fun write(source: Buffer, byteCount: Long) {
         if (byteCount < 0) throw IllegalArgumentException("byteCount < 0: " + byteCount)
-        serial.write(source.readByteArray(byteCount))
+        var bytesWritten = 0
+        source.require(byteCount)
+        serial.write(source.readByteArray(byteCount - bytesWritten))
     }
 
     override fun flush() {
     }
 
-    override fun onReceivedData(data: ByteArray) {
-        queue.put(data)
-    }
 }
 
 

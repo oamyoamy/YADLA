@@ -5,10 +5,8 @@ import com.kludgenics.alrightypump.DateTimeChangeRecord
 import com.kludgenics.alrightypump.therapy.SmbgRecord
 import okio.BufferedSink
 import okio.BufferedSource
-import org.joda.time.Chronology
-import org.joda.time.Instant
+import org.joda.time.*
 import org.joda.time.chrono.ISOChronology
-import kotlin.Iterator
 
 /**
  * Created by matthias on 11/5/15.
@@ -18,13 +16,22 @@ open class DexcomG4(private val source: BufferedSource,
                     private val sink: BufferedSink) : ContinuousGlucoseMonitor {
 
     companion object {
-        public val source: String get() = "alrightypump-Dexcom-G4-$serial"
+        val source: String get() = "alrightypump-Dexcom-G4-$serial"
         private var _serial = ""
-        public val serial: String get() = _serial
+        val serial: String get() = _serial
+    }
+
+    override val timeCorrectionOffset: Duration? get() {
+        val receiverTime = requestTime()
+        println("receiverTime:$receiverTime localTime:${LocalDateTime.now()}")
+        return if (receiverTime != null)
+            Duration(receiverTime.toDateTime(), DateTime.now())
+        else
+            null
     }
 
     var rawEnabled = true
-    override val serialNumber = requestSerialNumber()
+    override val serialNumber: String by lazy { requestSerialNumber() }
 
     override val cgmRecords: Sequence<DexcomCgmRecord>
         get() =
@@ -52,15 +59,15 @@ open class DexcomG4(private val source: BufferedSource,
     override val outOfRangeLow: Double
         get() = 39.0
 
-    public val egvRecords: Sequence<EgvRecord> get() = DataPageIterator<EgvRecord>(RecordPage.EGV_DATA).asSequence()
-    public val sgvRecords: Sequence<SgvRecord> get() = DataPageIterator<SgvRecord>(RecordPage.SENSOR_DATA).asSequence()
-    public val eventRecords: Sequence<EventRecord> get() = DataPageIterator<EventRecord>(RecordPage.USER_EVENT_DATA).asSequence()
-    public val settingsRecords: Sequence<UserSettingsRecord> get() = DataPageIterator<UserSettingsRecord>(RecordPage.USER_SETTING_DATA).asSequence()
-    public val calibrationRecords: Sequence<CalSetRecord> get() = DataPageIterator<CalSetRecord>(RecordPage.CAL_SET).asSequence()
-    override public val consumableRecords: Sequence<InsertionRecord> get() = DataPageIterator<InsertionRecord>(RecordPage.INSERTION_TIME).asSequence()
+    val egvRecords: Sequence<EgvRecord> get() = DataPageIterator<EgvRecord>(RecordPage.EGV_DATA).asSequence()
+    val sgvRecords: Sequence<SgvRecord> get() = DataPageIterator<SgvRecord>(RecordPage.SENSOR_DATA).asSequence()
+    val eventRecords: Sequence<EventRecord> get() = DataPageIterator<EventRecord>(RecordPage.USER_EVENT_DATA).asSequence()
+    val settingsRecords: Sequence<UserSettingsRecord> get() = DataPageIterator<UserSettingsRecord>(RecordPage.USER_SETTING_DATA).asSequence()
+    val calibrationRecords: Sequence<CalSetRecord> get() = DataPageIterator<CalSetRecord>(RecordPage.CAL_SET).asSequence()
+    override val consumableRecords: Sequence<InsertionRecord> get() = DataPageIterator<InsertionRecord>(RecordPage.INSERTION_TIME).asSequence()
 
-    public val version: String? by lazy { requestVersion() }
-    public val databasePartitionInfo: String? by lazy { readDatabasePartitionInfo() }
+    val version: String? by lazy { requestVersion() }
+    val databasePartitionInfo: String? by lazy { readDatabasePartitionInfo() }
 
     private inner class DexcomCgmSequence(private val egvs: Sequence<EgvRecord>,
                                           private val sgvs: Sequence<SgvRecord>?,
@@ -74,7 +81,7 @@ open class DexcomG4(private val source: BufferedSource,
             init {
                 val bgs: Sequence<Pair<EgvRecord, SgvRecord?>>
                 if (sgvs != null && calIterator != null) {
-                    val currentTime = Instant()
+                    val currentTime = LocalDateTime()
                     currentCal = calIterator.next()
                     while (currentCal!!.displayTime > currentTime && calIterator.hasNext())
                         currentCal = calIterator.next()
@@ -90,10 +97,12 @@ open class DexcomG4(private val source: BufferedSource,
 
             override fun next(): DexcomCgmRecord {
                 val bg = bgIterator.next()
-                if (currentCal != null && bg.first.displayTime < currentCal!!.displayTime && calIterator != null) {
-                    while (bg.first.displayTime < currentCal!!.displayTime && calIterator.hasNext())
+                val cal = currentCal
+                if (cal != null && bg.first.displayTime < cal.displayTime && calIterator != null) {
+                    while (bg.first.displayTime < cal.displayTime && calIterator.hasNext())
                         currentCal = calIterator.next()
-                    if (bg.first.displayTime < currentCal!!.displayTime)
+                    val finalCal = currentCal
+                    if (finalCal != null && bg.first.displayTime < finalCal.displayTime)
                         currentCal = null
                 }
                 return DexcomCgmRecord(bg.first, bg.second, currentCal)
@@ -149,7 +158,7 @@ open class DexcomG4(private val source: BufferedSource,
         }
     }
 
-    public fun ping(): Boolean {
+    fun ping(): Boolean {
         val command = Ping()
         val response = commandResponse(command)
         return response is Ping
@@ -170,18 +179,32 @@ open class DexcomG4(private val source: BufferedSource,
         return response.payloadString.utf8()
     }
 
-    public fun requestSerialNumber(): String {
+    fun requestTime(): LocalDateTime? {
+        val offsetResponse = commandResponse(ReadDisplayTimeOffset()) as? ReadDisplayTimeOffsetResponse
+        return if (offsetResponse != null) {
+            val timeResponse = commandResponse(ReadSystemTime()) as? ReadSystemTimeResponse
+            if (timeResponse != null) {
+                RecordPage.EPOCH + Duration((timeResponse.time.toLong()+offsetResponse.offset.toLong())*1000)
+            }
+            else
+                null
+        } else
+            null
+    }
+
+    fun requestSerialNumber(): String {
         val page = readDataPageRange(RecordPage.MANUFACTURING_DATA)
         if (page != null) {
             val pages = readDataPages(RecordPage.MANUFACTURING_DATA, page.first)
             pages.filterIsInstance<ManufacturingData>().flatMap { it.records }.forEach {
                 _serial = it.xml.substringAfter("SerialNumber=\"").substringBefore('"')
+
             }
         }
         return _serial
     }
 
-    public fun readDataPages(recordType: Int, start: Int, count: Int = 1): List<RecordPage> {
+    fun readDataPages(recordType: Int, start: Int, count: Int = 1): List<RecordPage> {
         val response = commandResponse(ReadDataPages(recordType, start, count))
         return if (response is ReadDataPagesResponse)
             response.pages
@@ -189,14 +212,14 @@ open class DexcomG4(private val source: BufferedSource,
             emptyList()
     }
 
-    public fun readDataPageRange(recordType: Int): Pair<Int, Int>? {
+    fun readDataPageRange(recordType: Int): Pair<Int, Int>? {
         val response = commandResponse(ReadDataPageRange(recordType))
         return if (response is ReadDataPageRangeResponse)
             response.start to response.end
         else null
     }
 
-    public fun commandResponse(command: DexcomCommand): ResponsePayload {
+    fun commandResponse(command: DexcomCommand): ResponsePayload {
         val packet = DexcomG4Request(command.command, command).frame
         sink.write(packet, packet.size())
         val response = DexcomG4Response(source)

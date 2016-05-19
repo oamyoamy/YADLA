@@ -6,21 +6,17 @@ import com.kludgenics.alrightypump.cloud.nightscout.records.json.Sgv
 import com.kludgenics.alrightypump.cloud.nightscout.records.therapy.NightscoutGlucoseValue
 import com.kludgenics.alrightypump.device.dexcom.g4.DexcomCgmRecord
 import com.kludgenics.alrightypump.therapy.*
-import com.squareup.moshi.FromJson
-import com.squareup.moshi.JsonDataException
-import com.squareup.moshi.Moshi
-import com.squareup.moshi.ToJson
-import com.squareup.okhttp.RequestBody
-import com.squareup.okhttp.ResponseBody
-import org.joda.time.Instant
-import org.joda.time.LocalTime
-import retrofit.Call
-import retrofit.http.*
+import com.squareup.moshi.*
+import okhttp3.RequestBody
+import okhttp3.ResponseBody
+import org.joda.time.*
+import retrofit2.Call
+import retrofit2.http.*
 import java.text.DecimalFormat
 import java.util.*
 
 interface NightscoutApiEntry : NightscoutEntry, Record {
-    override val time: Instant get() = Instant.parse(dateString)
+    override val time: LocalDateTime get() = LocalDateTime.parse(dateString)
     override val dateString: String get() = time.toString()
 }
 
@@ -50,7 +46,7 @@ interface NightscoutApiTreatment : NightscoutApiBaseTreatment, Record {
 
 interface NightscoutApiBaseTreatment : NightscoutApiEntry {
     // these two aren't quite accurate, but it is useful to unify entries and treatments.
-    override val time: Instant get() = Instant.parse(created_at)
+    override val time: LocalDateTime get() = LocalDateTime.parse(created_at)
     override val dateString: String get() = created_at
     val eventType: String
     val created_at: String
@@ -78,10 +74,10 @@ interface NightscoutApiProfileChangeTreatment : NightscoutApiBaseTreatment {
 }
 
 interface NightscoutProfile {
-    val startDate: Instant
+    val startDate: LocalDateTime
     val defaultProfile: String
     val store: Map<String, NightscoutProfileEntry>
-    val created_at: Instant
+    val created_at: LocalDateTime
 }
 
 interface NightscoutProfileEntry {
@@ -104,7 +100,7 @@ interface NightscoutProfileItem {
 }
 
 open class NightscoutTreatment(private val _map: MutableMap<String, Any?>) : NightscoutApiTreatment {
-    override val time: Instant
+    override val time: LocalDateTime
         get() = time
 
     companion object {
@@ -112,7 +108,7 @@ open class NightscoutTreatment(private val _map: MutableMap<String, Any?>) : Nig
         val basalFormat = DecimalFormat("###.###")
     }
 
-    public val map: Map<String, Any?> get() = _map
+    val map: Map<String, Any?> get() = _map
 
     // these two aren't present, but it is useful to unify treatments and entries
     override val source: String get() = enteredBy
@@ -134,15 +130,17 @@ open class NightscoutTreatment(private val _map: MutableMap<String, Any?>) : Nig
     override val absolute: Double? by map
     override val profile: String? by map
 
-    public fun applyRecord(record: Record) {
+    fun applyRecord(record: Record) {
         _map.putAll(arrayOf<Pair<String, Any?>>(
                 "enteredBy" to record.source,
-                "created_at" to record.time.toString(),
+                "created_at" to record.time.safeDateTime().toString(),
                 //"notes" to record.toString(),
                 "eventType" to "<none>"))
-        if (record is NormalBolusRecord)
-            _map.put("insulin", bolusFormat.format(record.requestedNormal).toDouble())
         if (record is BolusRecord) {
+            if (record.requestedNormal != null)
+                _map.put("insulin", bolusFormat.format(record.requestedNormal!!).toDouble())
+            if (record.deliveredNormal != null)
+                _map.put("insulin", bolusFormat.format(record.deliveredNormal!!).toDouble())
             if (record.bolusWizard != null) {
                 _map.putAll(arrayOf("glucose" to if (record.bolusWizard?.bg?.glucose != 0.0) record.bolusWizard?.bg?.glucose else null,
                         "units" to if (record.bolusWizard?.bg != null && record.bolusWizard?.bg?.glucose != 0.0) {
@@ -156,13 +154,16 @@ open class NightscoutTreatment(private val _map: MutableMap<String, Any?>) : Nig
                                         (record.bolusWizard?.recommendation?.correctionBolus ?: 0.0)) "Meal Bolus"
                                 else "Correction Bolus"))
             }
+            if (record.requestedExtended != null) {
+                _map.putAll(arrayOf("enteredInsulin" to basalFormat.format((record.requestedNormal ?: 0.0) + (record.requestedExtended ?: 0.0)).toDouble(),
+                        "duration" to (record.extendedDuration ?: record.expectedExtendedDuration)?.standardMinutes,
+                        "relative" to basalFormat.format(record.requestedExtended ?: 0.0
+                                / (record.expectedExtendedDuration?.standardMinutes?.toDouble() ?: 0.0 / 60.00)),
+                        "eventType" to "Combo Bolus"))
+            }
         }
         if (record is ExtendedBolusRecord) {
-            _map.putAll(arrayOf<Pair<String, Any?>>("enteredInsulin" to basalFormat.format((record.requestedNormal ?: 0.0) + record.requestedExtended).toDouble(),
-                    "duration" to (record.extendedDuration ?: record.expectedExtendedDuration).standardMinutes,
-                    "relative" to basalFormat.format((record.deliveredExtended ?: record.requestedExtended)
-                            / (record.expectedExtendedDuration.standardMinutes / 60.00)).toDouble(),
-                    "eventType" to "Combo Bolus"))
+            _map["eventType"] ="Combo Bolus"
         }
         if (record is TemporaryBasalRecord) {
             if (record.rate != null) {
@@ -192,20 +193,17 @@ open class NightscoutTreatment(private val _map: MutableMap<String, Any?>) : Nig
 
 class NightscoutJsonAdapter {
 
-    @FromJson
-    public fun treatmentFromJson(map: MutableMap<String, Any?>): NightscoutTreatment {
+    @FromJson fun treatmentFromJson(map: MutableMap<String, Any?>): NightscoutTreatment {
         return NightscoutTreatment(map.withDefault { null })
     }
 
-    @ToJson
-    public fun treatmentToJson(treatment: NightscoutTreatment): Map<String, Any?> {
+    @ToJson fun treatmentToJson(treatment: NightscoutTreatment): Map<String, Any?> {
         return treatment.map
     }
 
-    @ToJson
-    public fun entryToJson(entry: NightscoutEntryJson): Map<String, Any?> {
+    @ToJson fun entryToJson(entry: NightscoutEntryJson): Map<String, Any?> {
         val map = hashMapOf<String, Any?>()
-        map.putAll(arrayOf("date" to entry.time.millis,
+        map.putAll(arrayOf("date" to entry.time.safeDateTime().millis,
                 "dateString" to entry.dateString,
                 "device" to entry.source,
                 "type" to entry.type))
@@ -230,13 +228,12 @@ class NightscoutJsonAdapter {
         return map
     }
 
-    @FromJson
-    public fun entryFromJson(entry: MutableMap<String, String>): NightscoutEntryJson {
+    @FromJson fun entryFromJson(entry: MutableMap<String, String>): NightscoutEntryJson {
         return when (entry["type"] ?:  null) {
             "sgv" -> {
                 NightscoutEntryJson(NightscoutSgvJson(id = entry["_id"] as String,
                         type = entry["type"]!!,
-                        time = Instant(entry["date"]?.toLong()!!),
+                        time = LocalDateTime(entry["date"]?.toLong()!!),
                         dateString = entry["dateString"]!!,
                         source = entry["device"]!!,
                         sgv = entry["sgv"]?.toInt()!!,
@@ -249,13 +246,13 @@ class NightscoutJsonAdapter {
             }
             "mbg" -> NightscoutEntryJson(NightscoutMbgJson(id = entry["_id"] as String,
                     type = entry["type"] as String,
-                    time = Instant(entry["date"]?.toLong()!!),
+                    time = LocalDateTime(entry["date"]?.toLong()!!),
                     dateString = entry["dateString"] as String,
                     source = entry["device"] as String,
                     mbg = entry["mbg"]?.toInt()!!))
             "cal" -> NightscoutEntryJson(NightscoutCalJson(id = entry["_id"] as String,
                     type = entry["type"] as String,
-                    time = Instant(entry["date"]?.toLong()!!),
+                    time = LocalDateTime(entry["date"]?.toLong()!!),
                     dateString = entry["dateString"] as String,
                     source = entry["device"] as String,
                     slope = entry["slope"]?.toDouble()!!,
@@ -267,19 +264,19 @@ class NightscoutJsonAdapter {
     }
 }
 
-data class NightscoutEntryJson(public val rawEntry: NightscoutApiEntry) : NightscoutApiEntry by rawEntry
+data class NightscoutEntryJson(val rawEntry: NightscoutApiEntry) : NightscoutApiEntry by rawEntry
 
-data class NightscoutSgvJson(public override val id: String?,
-                             public override val type: String,
-                             public override val dateString: String,
-                             public override val time: Instant,
-                             public override val source: String,
-                             public override val sgv: Int,
-                             public override val direction: String?,
-                             public override val noise: Int?,
-                             public override val filtered: Int?,
-                             public override val unfiltered: Int?,
-                             public override val rssi: Int?) : NightscoutApiSgvEntry {
+data class NightscoutSgvJson(override val id: String?,
+                             override val type: String,
+                             override val dateString: String,
+                             override val time: LocalDateTime,
+                             override val source: String,
+                             override val sgv: Int,
+                             override val direction: String?,
+                             override val noise: Int?,
+                             override val filtered: Int?,
+                             override val unfiltered: Int?,
+                             override val rssi: Int?) : NightscoutApiSgvEntry {
     override val value: RawGlucoseValue
         get() = NightscoutGlucoseValue(this)
 
@@ -299,28 +296,28 @@ data class NightscoutSgvJson(public override val id: String?,
         }
     }
 
-    constructor(record: DexcomCgmRecord) : this(id = record.id, type = "sgv", time = record.time, dateString = record.time.toString(),
+    constructor(record: DexcomCgmRecord) : this(id = record.id, type = "sgv", time = record.time, dateString = record.time.safeDateTime().toString(),
             source = record.source, sgv = record.value.mgdl!!.toInt(), direction = directionString(record.egvRecord.trendArrow), rssi = record.sgvRecord?.rssi,
             unfiltered = record.sgvRecord?.unfiltered,
             filtered = record.sgvRecord?.filtered, noise = record.egvRecord.noise)
 
-    constructor(record: RawCgmRecord) : this(id = record.id, type = "sgv", time = record.time, dateString = record.time.toString(),
+    constructor(record: RawCgmRecord) : this(id = record.id, type = "sgv", time = record.time, dateString = record.time.safeDateTime().toString(),
             source = record.source, sgv = record.value.mgdl!!.toInt(), direction = null, rssi = null,
             unfiltered = record.value.unfiltered,
             filtered = record.value.filtered, noise = null)
 
-    constructor(record: CgmRecord) : this(id = record.id, type = "sgv", time = record.time, dateString = record.time.toString(),
+    constructor(record: CgmRecord) : this(id = record.id, type = "sgv", time = record.time, dateString = record.time.safeDateTime().toString(),
             source = record.source, sgv = record.value.mgdl!!.toInt(), direction = null, rssi = null, unfiltered = null,
             filtered = null, noise = null)
 
 }
 
-data class NightscoutMbgJson(public override val id: String?,
-                             public override val type: String,
-                             public override val dateString: String,
-                             public override val time: Instant,
-                             public override val source: String,
-                             public override val mbg: Int) : NightscoutApiMbgEntry {
+data class NightscoutMbgJson(override val id: String?,
+                             override val type: String,
+                             override val dateString: String,
+                             override val time: LocalDateTime,
+                             override val source: String,
+                             override val mbg: Int) : NightscoutApiMbgEntry {
     override val value: GlucoseValue
         get() = BaseGlucoseValue(mbg.toDouble(), GlucoseUnit.MGDL)
     override val manual: Boolean
@@ -332,15 +329,15 @@ data class NightscoutMbgJson(public override val id: String?,
             mbg = smbgRecord.value.mgdl!!.toInt())
 }
 
-data class NightscoutCalJson(public override val id: String? = null,
-                             public override val type: String,
-                             public override val dateString: String,
-                             public override val time: Instant,
-                             public override val source: String,
-                             public override val slope: Double,
-                             public override val intercept: Double,
-                             public override val scale: Double,
-                             public override val decay: Double? = null) : NightscoutApiCalEntry {
+data class NightscoutCalJson(override val id: String? = null,
+                             override val type: String,
+                             override val dateString: String,
+                             override val time: LocalDateTime,
+                             override val source: String,
+                             override val slope: Double,
+                             override val intercept: Double,
+                             override val scale: Double,
+                             override val decay: Double? = null) : NightscoutApiCalEntry {
     constructor (calibrationRecord: CalibrationRecord) : this(type = "cal", time = calibrationRecord.time,
             dateString = calibrationRecord.time.toString(),
             source = calibrationRecord.source,
@@ -349,66 +346,92 @@ data class NightscoutCalJson(public override val id: String? = null,
             scale = calibrationRecord.scale)
 }
 
+data class NightscoutStatus (var status: String="",
+                             var name: String="",
+                             var version: String="",
+                             var serverTime: String="",
+                             var apiEnabled: Boolean=false,
+                             var careportalEnabled: Boolean=false,
+                             var head: String="")
+
+data class NightscoutCodeVerification (var status: Int = 0,
+                                       var message: String = "")
+
 @Suppress("UNUSED_METHOD")
 interface NightscoutApi {
     companion object {
         fun registerTypeAdapters(builder: Moshi.Builder): Moshi.Builder {
-            return builder.add(NightscoutJsonAdapter())
+            return builder
+                    .add(NightscoutJsonAdapter())
         }
     }
 
-    @GET("/api/v1/entries/sgv.json")
+    @GET("api/v1/status.json")
+    fun getStatus(): Call<NightscoutStatus>
+
+    @GET("api/v1/verifyauth")
+    fun verifyAuth(): Call<NightscoutCodeVerification>
+
+    @GET("api/v1/entries/sgv.json")
     fun getSgvRecords(@Query("count") count: Int, @Query("find[date][\$gte]") start: Long): Call<MutableList<NightscoutSgvJson>>
 
-    @GET("/api/v1/entries/mbg.json")
+    @GET("api/v1/entries/mbg.json")
     fun getMeterRecords(@Query("count") count: Int, @Query("find[date][\$gte]") start: Long): Call<MutableList<NightscoutMbgJson>>
 
-    @GET("/api/v1/entries/cal.json")
+    @GET("api/v1/entries/cal.json")
     fun getCalRecords(@Query("count") count: Int, @Query("find[date][\$gte]") start: Long): Call<MutableList<NightscoutCalJson>>
 
-    @GET("/api/v1/entries.json")
+    @GET("api/v1/entries.json")
     fun getRecordsSince(@Query("find[date][\$gte]") since: Long, @Query("count") count: Int): Call<MutableList<NightscoutEntryJson>>
 
-    @GET("/api/v1/entries.json")
+    @GET("api/v1/entries.json")
     fun getRecordsBefore(@Query("find[date][\$lt]") before: Long, @Query("count") count: Int): Call<MutableList<NightscoutEntryJson>>
 
-    @GET("/api/v1/entries.json")
+    @GET("api/v1/entries.json")
     fun getRecordsBetween(@Query("find[date][\$gte]") since: Long, @Query("find[date][\$lt]") before: Long, @Query("count") count: Int): Call<MutableList<NightscoutEntryJson>>
 
-    @POST("/api/v1/entries.json")
+    @POST("api/v1/entries.json")
     @Headers("Content-Type: application/json")
     fun postRecords(@Header("api-secret") apiSecret: String, @Body body: MutableList<NightscoutEntryJson>): Call<MutableList<NightscoutEntryJson>>
 
-    @POST("/api/v1/entries.json")
+    @POST("api/v1/entries.json")
     @Headers("Content-Type: application/json")
-    fun postRecords(@Body body: MutableList<NightscoutEntryJson>): Call<MutableList<NightscoutEntryJson>>
+    fun postRecords(@Body body: MutableList<NightscoutEntryJson>): Call<ResponseBody>
 
-    @GET("/api/v1/treatments")
+    @GET("api/v1/treatments")
     fun getTreatmentsBefore(@Query("find[created_at][\$lt]") since: String): Call<MutableList<NightscoutTreatment>>
 
-    @GET("/api/v1/treatments")
+    @GET("api/v1/treatments")
     fun getTreatmentsBefore(@Query("find[created_at][\$lt]") before: String, @Query("count") count: Int): Call<MutableList<NightscoutTreatment>>
 
-    @GET("/api/v1/treatments")
+    @GET("api/v1/treatments")
     fun getTreatmentsSince(@Query("find[created_at][\$gte]") since: String): Call<MutableList<NightscoutTreatment>>
 
-    @GET("/api/v1/treatments")
+    @GET("api/v1/treatments")
     fun getTreatmentsSince(@Query("find[created_at][\$gte]") since: String, @Query("count") count: Int): Call<MutableList<NightscoutTreatment>>
 
-    @GET("/api/v1/treatments")
+    @GET("api/v1/treatments")
     fun getTreatmentsBetween(@Query("find[created_at][\$gte]") since: String, @Query("find[created_at][\$lt]") before: String, @Query("count") count: Int): Call<MutableList<NightscoutTreatment>>
 
-    @POST("/api/v1/treatments")
+    @POST("api/v1/treatments")
     @Headers("Content-Type: application/json")
     fun postTreatments(@Header("api-secret") apiSecret: String, @Body treatments: MutableList<NightscoutTreatment>): Call<ResponseBody>
 
-    @POST("/api/v1/treatments")
+    @POST("api/v1/treatments")
     @Headers("Content-Type: application/json")
     fun postTreatments(@Body treatments: MutableList<NightscoutTreatment>): Call<ResponseBody>
 
-    @GET("/api/v1/profile")
+    @GET("api/v1/profile")
     fun getProfile(): Call<ResponseBody>
 
-    @POST("/api/v1/profile")
+    @POST("api/v1/profile")
     fun postProfiles(@Header("api-secret") apiSecret: String, @Body profile: RequestBody): Call<ResponseBody>
+}
+
+fun LocalDateTime.safeDateTime(): DateTime = try {
+    this.toDateTime()
+} catch (e: org.joda.time.IllegalInstantException) {
+    val localTime = toLocalTime()
+    val localDate = this.toLocalDate().toDateTimeAtStartOfDay().plus(localTime.millisOfDay.toLong())
+    this.plus(Duration(DateTimeZone.getDefault().getOffsetFromLocal(localDate.millis).toLong())).toDateTime()
 }

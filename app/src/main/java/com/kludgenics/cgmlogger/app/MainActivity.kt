@@ -1,47 +1,60 @@
 package com.kludgenics.cgmlogger.app
 
+import android.content.Intent
+import android.databinding.DataBindingUtil
 import android.os.Bundle
-import android.support.design.widget.FloatingActionButton
+import android.support.v7.app.AppCompatActivity
 import android.support.v7.widget.LinearLayoutManager
-import android.support.v7.widget.RecyclerView
 import android.view.Menu
 import android.view.MenuItem
-import com.kludgenics.cgmlogger.app.adapter.AgpAdapter
-import com.kludgenics.cgmlogger.app.service.TaskService
-import org.jetbrains.anko.*
-import org.joda.time.Period
+import com.kludgenics.cgmlogger.app.adapter.CardAdapter
+import com.kludgenics.cgmlogger.app.databinding.ActivityMainBinding
+import com.kludgenics.cgmlogger.app.databinding.DialogConfigureNightscoutBinding
+import com.kludgenics.cgmlogger.app.model.PersistedRecord
+import com.kludgenics.cgmlogger.app.model.SyncStore
+import com.kludgenics.cgmlogger.app.service.SyncService
+import com.kludgenics.cgmlogger.app.viewmodel.NightscoutConfig
+import com.kludgenics.cgmlogger.app.viewmodel.ObservableStatus
+import com.kludgenics.cgmlogger.app.viewmodel.RealmStatus
+import com.kludgenics.cgmlogger.extension.group
+import com.kludgenics.cgmlogger.extension.transaction
+import com.kludgenics.cgmlogger.extension.where
+import io.realm.Realm
+import io.realm.Sort
+import org.jetbrains.anko.AnkoLogger
+import org.jetbrains.anko.alert
+import org.jetbrains.anko.async
+import org.jetbrains.anko.info
+import org.joda.time.Duration
+import org.joda.time.Instant
+import java.util.*
 
-public class MainActivity : BaseActivity(), AnkoLogger {
-    override protected val navigationId = R.id.nav_home
+class MainActivity :  AppCompatActivity(), AnkoLogger {
 
-    // Note: Your consumer key and secret should be obfuscated in your source code before shipping.
-    companion object {
-        const val TWITTER_KEY = "XpH1SOqMSaH3v8P7A9e0RFBHm";
-        const val TWITTER_SECRET = "BYYqmgAxxSyzfxbkYomajXZNvthMmvMLrdhhOChwHiUqGtln94";
-    }
+    val realm = Realm.getDefaultInstance()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-        setupNavigationBar()
-        setupActionBar()
+        val binding: ActivityMainBinding = DataBindingUtil.setContentView(this, R.layout.activity_main)
+        setSupportActionBar(binding.includedListViewpager.toolbar)
 
-        val fab = find<FloatingActionButton>(R.id.fab)
-        fab.onClick {
-        }
-        //startService(intentFor<LocationIntentService>().setAction(LocationIntentService.ACTION_START_LOCATION_UPDATES))
-        /// / Set up the drawer.
-
-        val recycler = find<RecyclerView>(R.id.recycler)
-        recycler.adapter = AgpAdapter(listOf(1, 3, 7, 14, 30, 60, 90).map { Period.days(it) })
-        recycler.layoutManager = LinearLayoutManager(ctx)
+        binding.status = ObservableStatus(realm.where<RealmStatus>().findAllSorted("modificationTime", Sort.DESCENDING).firstOrNull() ?: RealmStatus(active = true, modificationTime = Date(), statusText = "Hello World", serialNumber = "SM12345678"))
+        // TODO this is a query on the UI thread.  It would be nice if it could be done async, but the async versions of queries don't play well with
+        binding.includedListViewpager.recycler.adapter = CardAdapter(
+                realm.where<RealmStatus>()
+                        .findAllSorted("modificationTime", Sort.DESCENDING)
+                        .distinct("serialNumber"))
+        binding.includedListViewpager.recycler.layoutManager = LinearLayoutManager(this)
     }
 
-
+    override fun onDestroy() {
+        super.onDestroy()
+        realm.close()
+    }
 
     override fun onStart() {
         super.onStart()
-        TaskService.syncNow(this)
+        startService(Intent(this, SyncService::class.java))
     }
 
     override fun onStop() {
@@ -49,15 +62,8 @@ public class MainActivity : BaseActivity(), AnkoLogger {
     }
 
     override fun onCreateOptionsMenu(menu: Menu?): Boolean {
-        /*if (!mNavigationDrawerFragment!!.isDrawerOpen()) {
-            // Only show items in the action bar relevant to this screen
-            // if the drawer is not showing. Otherwise, let the drawer
-            // decide what to show in the action bar.
-            getMenuInflater().inflate(R.menu.main, menu)
-            restoreActionBar()
-            return true
-        }*/
-        return super.onCreateOptionsMenu(menu)
+        menuInflater.inflate(R.menu.main, menu);
+        return true
     }
 
     override fun onOptionsItemSelected(item: MenuItem?): Boolean {
@@ -68,7 +74,17 @@ public class MainActivity : BaseActivity(), AnkoLogger {
 
         //noinspection SimplifiableIfStatement
         if (id == R.id.action_settings) {
-            return true
+            alert {
+                title("Nightscout URL")
+                message("Set this to your Nightscout's address.")
+                val binding = DialogConfigureNightscoutBinding.inflate(layoutInflater)
+                binding.config = NightscoutConfig(SyncStore())
+                customView ( binding.root )
+                negativeButton("CANCEL") {
+                    this.cancel()
+                }
+                positiveButton("SAVE", { binding.config.onSave() })
+            }.show()
         }
 
         return super.onOptionsItemSelected(item)
